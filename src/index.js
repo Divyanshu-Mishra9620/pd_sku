@@ -1,17 +1,11 @@
 require("dotenv").config();
 
 const express = require("express");
+const fs = require("fs");
 const multer = require("multer");
+const path = require("path");
 
 const { uploadInputImage, uploadVariant } = require("./cloudinary");
-const {
-  publishJob,
-  consumeJobs,
-  closeRabbitMq,
-  RABBITMQ_QUEUE,
-  RABBITMQ_URL,
-  formatRabbitError,
-} = require("./rabbitmq");
 const {
   uploadImageToFilesApi,
   submitBatchJob,
@@ -25,9 +19,8 @@ const {
 
 const PORT = process.env.PORT || 3000;
 const VARIANT_COUNT = parseInt(process.env.VARIANT_COUNT || "50", 10);
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
-const MAX_POLL_ATTEMPTS = parseInt(process.env.MAX_POLL_ATTEMPTS || "120", 10);
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const JOBS_DIR = path.join(process.cwd(), "jobs");
 const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"];
 const FAILED_STATES = [
   "JOB_STATE_FAILED",
@@ -36,10 +29,6 @@ const FAILED_STATES = [
   "CANCELLED",
 ];
 const SUCCEEDED_STATES = ["JOB_STATE_SUCCEEDED", "SUCCEEDED"];
-
-const jobStore = new Map();
-let rabbitWorkerStarted = false;
-let rabbitWorkerStarting = null;
 
 const app = express();
 app.use(express.json());
@@ -60,8 +49,55 @@ const upload = multer({
   },
 });
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function ensureJobsDir() {
+  fs.mkdirSync(JOBS_DIR, { recursive: true });
+}
+
+function getJobFilePath(batchName) {
+  return path.join(JOBS_DIR, `${encodeURIComponent(batchName)}.json`);
+}
+
+function serializeJob(data) {
+  const serialized = { ...data };
+
+  if (Buffer.isBuffer(serialized.imageBuffer)) {
+    serialized.imageBufferBase64 = serialized.imageBuffer.toString("base64");
+    delete serialized.imageBuffer;
+  }
+
+  return serialized;
+}
+
+function hydrateJob(data) {
+  if (!data) return null;
+
+  const hydrated = { ...data };
+
+  if (hydrated.imageBufferBase64) {
+    hydrated.imageBuffer = Buffer.from(hydrated.imageBufferBase64, "base64");
+  }
+
+  return hydrated;
+}
+
+function writeJob(batchName, data) {
+  ensureJobsDir();
+  const payload = serializeJob({ ...data, batchName });
+  fs.writeFileSync(
+    getJobFilePath(batchName),
+    JSON.stringify(payload, null, 2),
+  );
+  return hydrateJob(payload);
+}
+
+function readJob(batchName) {
+  try {
+    const data = JSON.parse(fs.readFileSync(getJobFilePath(batchName), "utf8"));
+    return hydrateJob(data);
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
 }
 
 async function buildResultPayload(batchName, job, cached, skipUpload = false) {
@@ -125,93 +161,6 @@ async function buildResultPayload(batchName, job, cached, skipUpload = false) {
   };
 }
 
-async function processBatchJob(batchName) {
-  const cached = jobStore.get(batchName);
-  if (!cached) {
-    console.warn(`Missing local cache for ${batchName}`);
-    return;
-  }
-
-  try {
-    cached.status = "PROCESSING";
-    cached.message = "Waiting for Gemini batch completion.";
-    cached.updatedAt = new Date().toISOString();
-
-    let job = null;
-    for (let attempt = 1; attempt <= MAX_POLL_ATTEMPTS; attempt += 1) {
-      job = await getBatchStatus(batchName);
-      const state = job.state ?? "UNKNOWN";
-
-      cached.state = state;
-      cached.pollAttempts = attempt;
-      cached.updatedAt = new Date().toISOString();
-
-      if (FAILED_STATES.includes(state)) {
-        cached.status = "FAILED";
-        cached.error = `Batch job ended with state: ${state}`;
-        return;
-      }
-
-      if (SUCCEEDED_STATES.includes(state)) {
-        cached.status = "GENERATING_VARIANTS";
-        cached.message = "Generating and uploading variant images.";
-        cached.updatedAt = new Date().toISOString();
-        cached.result = await buildResultPayload(batchName, job, cached);
-        cached.status = "COMPLETED";
-        cached.message = cached.result.message;
-        cached.completedAt = new Date().toISOString();
-        cached.updatedAt = cached.completedAt;
-        return;
-      }
-
-      await sleep(POLL_INTERVAL_MS);
-    }
-
-    cached.status = "TIMED_OUT";
-    cached.error = `Batch did not finish after ${MAX_POLL_ATTEMPTS} polling attempts.`;
-    cached.updatedAt = new Date().toISOString();
-  } catch (err) {
-    cached.status = "FAILED";
-    cached.error = err.message;
-    cached.updatedAt = new Date().toISOString();
-    throw err;
-  }
-}
-
-async function startRabbitWorker() {
-  if (rabbitWorkerStarted) return true;
-  if (rabbitWorkerStarting) return rabbitWorkerStarting;
-
-  rabbitWorkerStarting = (async () => {
-    try {
-      await consumeJobs(async ({ batchName }) => {
-        if (!batchName) throw new Error("RabbitMQ job is missing batchName");
-        console.log(`[Worker] Processing ${batchName}`);
-        await processBatchJob(batchName);
-      });
-      rabbitWorkerStarted = true;
-      console.log(`Consuming queue "${RABBITMQ_QUEUE}"`);
-      return true;
-    } catch (err) {
-      console.error(
-        `Worker disabled: ${formatRabbitError(err)}. ` +
-          `Make sure RabbitMQ is running at ${RABBITMQ_URL}.`,
-      );
-      return false;
-    } finally {
-      rabbitWorkerStarting = null;
-    }
-  })();
-
-  return rabbitWorkerStarting;
-}
-
-async function startRabbitWorkerOnBoot() {
-  try {
-    await startRabbitWorker();
-  } catch (_err) {}
-}
-
 app.post("/generate", upload.single("image"), async (req, res) => {
   try {
     if (!req.file) {
@@ -230,42 +179,25 @@ app.post("/generate", upload.single("image"), async (req, res) => {
     const fileUri = await uploadImageToFilesApi(req.file.buffer, mimeType);
 
     const batchJob = await submitBatchJob(fileUri, variantCount);
-    jobStore.set(batchJob.name, {
+    const cached = writeJob(batchJob.name, {
       imageBuffer: req.file.buffer,
       mimeType,
       inputImageUrl,
       variantCount,
       state: batchJob.state,
       status: "QUEUED",
-      message: "Queued for background variant generation.",
+      message: "Batch job submitted. Poll GET /results/:batchName for status.",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
 
-    let queued = false;
-    try {
-      queued = await publishJob({ batchName: batchJob.name });
-      startRabbitWorker();
-    } catch (err) {
-      const cached = jobStore.get(batchJob.name);
-      cached.status = "QUEUE_FAILED";
-      cached.queueError = err.message;
-      cached.message =
-        "RabbitMQ publish failed. Completed batches can still be processed via GET /results.";
-      console.error("Publish failed:", formatRabbitError(err));
-    }
-
     return res.status(202).json({
       batchName: batchJob.name,
       state: batchJob.state,
-      status: jobStore.get(batchJob.name).status,
+      status: cached.status,
       variantCount,
       inputImageUrl,
-      queued,
-      queue: RABBITMQ_QUEUE,
-      message: queued
-        ? `Batch job submitted and queued with ${variantCount} variant requests.`
-        : `Batch job submitted with ${variantCount} variant requests, but RabbitMQ queueing failed.`,
+      message: `Batch job submitted with ${variantCount} variant requests. Poll GET /results/${batchJob.name}.`,
     });
   } catch (err) {
     console.error("[/generate] Error:", err.message);
@@ -279,33 +211,26 @@ app.post("/generate", upload.single("image"), async (req, res) => {
 app.get("/results/:batchName(*)", async (req, res) => {
   try {
     const batchName = req.params.batchName;
-    const cached = jobStore.get(batchName);
+    let cached = readJob(batchName);
 
     if (cached?.result) {
       return res.json(cached.result);
-    }
-
-    if (
-      cached &&
-      !["QUEUE_FAILED", "FAILED", "TIMED_OUT"].includes(cached.status)
-    ) {
-      return res.status(202).json({
-        batchName,
-        state: cached.state ?? "UNKNOWN",
-        status: cached.status,
-        message:
-          cached.message ??
-          "Batch job is queued or processing in the background.",
-        pollAttempts: cached.pollAttempts ?? 0,
-        inputImageUrl: cached.inputImageUrl,
-        updatedAt: cached.updatedAt,
-      });
     }
 
     const job = await getBatchStatus(batchName);
     const state = job.state ?? "UNKNOWN";
 
     if (FAILED_STATES.includes(state)) {
+      if (cached) {
+        cached = writeJob(batchName, {
+          ...cached,
+          state,
+          status: "FAILED",
+          error: `Batch job ended with state: ${state}`,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+
       return res.status(422).json({
         batchName,
         state,
@@ -314,11 +239,24 @@ app.get("/results/:batchName(*)", async (req, res) => {
     }
 
     if (!SUCCEEDED_STATES.includes(state)) {
-      return res.json({
+      if (cached) {
+        cached = writeJob(batchName, {
+          ...cached,
+          state,
+          status: "PROCESSING",
+          message: "Batch job is still processing. Please poll again later.",
+          updatedAt: new Date().toISOString(),
+        });
+      }
+
+      return res.status(202).json({
         batchName,
         state,
+        status: cached?.status ?? "PROCESSING",
         message: "Batch job is still processing. Please poll again later.",
         completionStats: job.completionStats ?? null,
+        inputImageUrl: cached?.inputImageUrl,
+        updatedAt: cached?.updatedAt,
       });
     }
 
@@ -333,13 +271,17 @@ app.get("/results/:batchName(*)", async (req, res) => {
 
     const skipUpload = req.query.upload === "false";
     const result = await buildResultPayload(batchName, job, cached, skipUpload);
-    cached.result = result;
-    cached.status = "COMPLETED";
-    cached.message = result.message;
-    cached.completedAt = new Date().toISOString();
-    cached.updatedAt = cached.completedAt;
+    cached = writeJob(batchName, {
+      ...cached,
+      result,
+      state,
+      status: "COMPLETED",
+      message: result.message,
+      completedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
 
-    return res.json(result);
+    return res.json(cached.result);
   } catch (err) {
     console.error("[/results] Error:", err.message);
     return res.status(500).json({
@@ -359,9 +301,7 @@ app.get("/health", (_req, res) =>
       imageGen: IMAGE_GEN_MODEL,
       supportedFreeImageModels: FREE_IMAGE_MODELS,
     },
-    rabbitmq: {
-      queue: RABBITMQ_QUEUE,
-    },
+    jobsDir: JOBS_DIR,
   }),
 );
 
@@ -385,12 +325,6 @@ app.listen(PORT, () => {
   console.log(
     `Server: http://localhost:${PORT} || Variants: ${VARIANT_COUNT} per batch`,
   );
-  startRabbitWorkerOnBoot();
-});
-
-process.on("SIGINT", async () => {
-  await closeRabbitMq();
-  process.exit(0);
 });
 
 module.exports = app;
